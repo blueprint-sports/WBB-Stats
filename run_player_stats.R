@@ -388,13 +388,38 @@ print(sample_players)
 # EXPORT COMPREHENSIVE DATASET
 # =============================================================================
 
+full_player_info_womens_clean <- full_player_info_womens|>
+  select(-field_goals_made, 
+         -field_goals_attempted,
+         -three_point_field_goals_made,
+         -three_point_field_goals_attempted, 
+         -three_point_freq_pct,
+         -free_throws_made,
+         -free_throws_attempted,
+         -rim_freq_pct,
+         -mid_range_freq_pct,
+         -Unknown_fg_pct,
+         -`Corner 3_fg_pct`,
+         -`Above Break 3_fg_pct`,
+         -`Long 2_fg_pct`,
+         -total_minutes.y,
+         -games_played.y,
+         -def_archetype_1_fit,
+         -def_archetype_2_fit,
+         -def_archetype_3_fit,
+         -def_archetype_4_fit,
+         -def_archetype_5_fit,
+         -def_archetype_6_fit)|>
+  rename(total_minutes = total_minutes.x)|>
+  rename(games_played = games_played.x)
+
 cat("\n=== EXPORTING COMPREHENSIVE DATASET ===\n")
 
 # Save as CSV for external use
-write.csv(full_player_info_womens, "full_player_info_womens.csv", row.names = FALSE)
+write.csv(full_player_info_womens_clean, "full_player_info_womens.csv", row.names = FALSE)
 
 # Save as RDS for R use
-saveRDS(full_player_info_womens, "full_player_info_womens.rds")
+saveRDS(full_player_info_womens_clean, "full_player_info_womens.rds")
 
 cat("Comprehensive dataset exported to:\n")
 cat("- full_player_info_womens.csv\n")
