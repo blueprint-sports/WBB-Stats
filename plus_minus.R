@@ -155,3 +155,26 @@ cat("Plus/minus per minute range:", round(min(player_plus_minus$plus_minus_per_m
 cat("Mean plus/minus per minute:", round(mean(player_plus_minus$plus_minus_per_minute), 3), "\n")
 
 cat("\nResults saved to womens_basketball_plus_minus_2024.csv\n")
+
+# Create plus_minus_stats object for compatibility with other scripts
+plus_minus_stats <- player_plus_minus %>%
+  select(
+    athlete_id = player_id,
+    athlete_display_name,
+    team_display_name,
+    games_played,
+    total_minutes,
+    total_plus_minus,
+    plus_minus_per_minute
+  ) %>%
+  # Add team_points_for calculation (needed for shooting_analysis)
+  left_join(
+    all_player_pm %>%
+      group_by(player_id) %>%
+      # Calculate total points scored by player's team while on court
+      summarise(
+        team_points_for = sum(pmax(plus_minus, 0), na.rm = TRUE), # Points gained while on court
+        .groups = 'drop'
+      ),
+    by = c("athlete_id" = "player_id")
+  )

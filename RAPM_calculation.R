@@ -3,12 +3,214 @@ library(Matrix)
 library(glmnet)
 library(knitr)
 
-# Source the main script to get rapm_final dataset
+# Load base data first
 source("wbb_player_stats.R")
 
-# Check if rapm_final exists
-if(!exists("ramp_final")) {
-  stop("rapm_final dataset not found. Please run wbb_player_stats.R first.")
+# Check if required data exists
+if(!exists("player_box")) {
+  stop("player_box dataset not found. Please ensure wbb_player_stats.R ran successfully.")
+}
+if(!exists("wbb_pbp")) {
+  stop("wbb_pbp dataset not found. Please ensure wbb_player_stats.R ran successfully.")
+}
+
+# =============================================================================
+# RAPM ANALYSIS: TRACKING PLAYERS ON COURT FOR EACH PLAY
+# =============================================================================
+
+# Load data.table for efficient processing
+library(data.table)
+
+# Get starting lineups for each game
+starting_lineups <- player_box |>
+  filter(starter == TRUE) |>
+  select(game_id, team_id, athlete_id, athlete_display_name) |>
+  group_by(game_id, team_id) |>
+  summarise(
+    starters = list(athlete_id),
+    starter_names = list(athlete_display_name),
+    num_starters = n(),
+    .groups = 'drop'
+  )
+
+# Create optimized stint tracking function using data.table
+track_stints_dt <- function() {
+  # Convert to data.table for speed
+  pbp_dt <- as.data.table(wbb_pbp)
+  starters_dt <- as.data.table(starting_lineups)
+  
+  # Get games with complete data
+  valid_games <- intersect(pbp_dt$game_id, starters_dt$game_id)
+  cat("Processing", length(valid_games), "games with data.table...\n")
+  
+  # Filter to valid games
+  pbp_dt <- pbp_dt[game_id %in% valid_games]
+  starters_dt <- starters_dt[game_id %in% valid_games]
+  
+  # Set keys for fast joining
+  setkey(pbp_dt, game_id, game_play_number)
+  setkey(starters_dt, game_id)
+  
+  # Process each game using data.table operations
+  stint_results <- pbp_dt[, {
+    # Get this game's data
+    game_pbp <- .SD
+    game_starters <- starters_dt[game_id == .BY$game_id]
+    
+    if(nrow(game_starters) != 2) {
+      data.table()
+    } else {
+      # Initialize lineups
+      home_team_id <- game_pbp$home_team_id[1]
+      away_team_id <- game_pbp$away_team_id[1]
+      
+      home_starters <- game_starters[team_id == home_team_id]$starters[[1]]
+      away_starters <- game_starters[team_id == away_team_id]$starters[[1]]
+      
+      # Current lineups
+      home_lineup <- home_starters
+      away_lineup <- away_starters
+      
+      # Process substitutions in order
+      game_subs <- game_pbp[type_text == "Substitution"]
+      
+      # Create lineup tracking vectors
+      lineup_data <- data.table(
+        game_play_number = game_pbp$game_play_number,
+        home_player_1 = home_lineup[1],
+        home_player_2 = home_lineup[2],
+        home_player_3 = home_lineup[3],
+        home_player_4 = home_lineup[4],
+        home_player_5 = home_lineup[5],
+        away_player_1 = away_lineup[1],
+        away_player_2 = away_lineup[2],
+        away_player_3 = away_lineup[3],
+        away_player_4 = away_lineup[4],
+        away_player_5 = away_lineup[5]
+      )
+      
+      # Update for each substitution
+      if(nrow(game_subs) > 0) {
+        for(i in 1:nrow(game_subs)) {
+          sub <- game_subs[i]
+          sub_play_num <- sub$game_play_number
+          
+          # Parse substitution
+          if(grepl("subbing out", sub$text, ignore.case = TRUE)) {
+            player_out <- sub$athlete_id_1
+            if(sub$team_id == home_team_id) {
+              home_lineup <- home_lineup[home_lineup != player_out]
+            } else {
+              away_lineup <- away_lineup[away_lineup != player_out]
+            }
+          } else if(grepl("subbing in", sub$text, ignore.case = TRUE)) {
+            player_in <- sub$athlete_id_1
+            if(sub$team_id == home_team_id) {
+              home_lineup <- c(home_lineup, player_in)
+            } else {
+              away_lineup <- c(away_lineup, player_in)
+            }
+          }
+          
+          # Update all subsequent plays
+          lineup_data[game_play_number >= sub_play_num, `:=`(
+            home_player_1 = home_lineup[1],
+            home_player_2 = home_lineup[2],
+            home_player_3 = home_lineup[3],
+            home_player_4 = home_lineup[4],
+            home_player_5 = home_lineup[5],
+            away_player_1 = away_lineup[1],
+            away_player_2 = away_lineup[2],
+            away_player_3 = away_lineup[3],
+            away_player_4 = away_lineup[4],
+            away_player_5 = away_lineup[5]
+          )]
+        }
+      }
+      
+      lineup_data[, game_id := .BY$game_id]
+      lineup_data
+    }
+  }, by = game_id]
+  
+  return(stint_results)
+}
+
+# Process all games
+cat("Starting lineup tracking for all games...\n")
+start_full_time <- Sys.time()
+
+all_stint_data <- track_stints_dt()
+
+end_full_time <- Sys.time()
+full_processing_time <- as.numeric(difftime(end_full_time, start_full_time, units = "secs"))
+
+cat("Processing time:", round(full_processing_time / 60, 2), "minutes\n")
+cat("Total rows processed:", nrow(all_stint_data), "\n")
+cat("Total games processed:", length(unique(all_stint_data$game_id)), "\n")
+
+# Clean up duplicate columns
+if(nrow(all_stint_data) > 0) {
+  unique_cols_final <- !duplicated(names(all_stint_data))
+  all_stint_clean <- all_stint_data[, ..unique_cols_final]
+} else {
+  stop("No stint data processed")
+}
+
+# =============================================================================
+# PREPARE CLEAN DATASET FOR RAPM ANALYSIS
+# =============================================================================
+
+if(exists("all_stint_clean") && nrow(all_stint_clean) > 0) {
+  cat("\n\n=== PREPARING RAPM DATASET ===\n")
+  
+  # Create clean RAPM dataset with only 10-player plays
+  cat("Creating clean RAPM dataset...\n")
+  
+  # Convert to tibble and add player counts (vectorized approach)
+  rapm_data_tibble <- as_tibble(all_stint_clean)
+  
+  # Vectorized player count calculation
+  player_cols <- c("home_player_1", "home_player_2", "home_player_3", "home_player_4", "home_player_5",
+                   "away_player_1", "away_player_2", "away_player_3", "away_player_4", "away_player_5")
+  
+  # Count non-NA values across player columns (much faster than rowwise)
+  total_players <- rowSums(!is.na(rapm_data_tibble[player_cols]))
+  
+  # Filter to only plays with exactly 10 players
+  rapm_data <- rapm_data_tibble[total_players == 10, ]
+  
+  cat("Original plays:", nrow(all_stint_clean), "\n")
+  cat("Plays with exactly 10 players:", nrow(rapm_data), "\n")
+  cat("Percentage retained:", round(100 * nrow(rapm_data) / nrow(all_stint_clean), 2), "%\n")
+  
+  # Join with pbp data to add play context
+  cat("Adding play context from pbp data...\n")
+  
+  rapm_with_context <- rapm_data |>
+    left_join(
+      wbb_pbp |> select(game_id, game_play_number, type_text, period_number,
+                        clock_display_value, home_score, away_score, scoring_play),
+      by = c("game_id", "game_play_number")
+    )
+  
+  cat("Plays with context added:", nrow(rapm_with_context), "\n")
+  
+  # Filter out substitutions for RAPM (not meaningful possessions)
+  rapm_final <- rapm_with_context |>
+    filter(type_text != "Substitution" | is.na(type_text))
+  
+  cat("Non-substitution plays for RAPM:", nrow(rapm_final), "\n")
+  cat("Games in RAPM dataset:", length(unique(rapm_final$game_id)), "\n")
+  
+  cat("\n✅ RAPM dataset ready!\n")
+  cat("- Variable name: rapm_final\n")
+  cat("- Rows:", nrow(rapm_final), "\n")
+  cat("- Columns:", ncol(rapm_final), "\n")
+  cat("- Each row = 1 play with 10 players tracked\n")
+  
+} else {
+  cat("❌ No stint data available for RAPM preparation\n")
 }
 
 cat("Starting RAPM calculation for women's basketball...\n")
@@ -84,100 +286,57 @@ get_players <- function(lineup_data) {
 players <- get_players(lineup_data)
 print(paste0("There are ", length(players), " unique players in the dataset."))
 
-# Create sparse matrix for RAPM model
-make_matrix_rows <- function(lineup, players_in) {
-  home_player1 <- lineup[1]
-  home_player2 <- lineup[2]
-  home_player3 <- lineup[3]
-  home_player4 <- lineup[4]
-  home_player5 <- lineup[5]
-  away_player1 <- lineup[6]
-  away_player2 <- lineup[7]
-  away_player3 <- lineup[8]
-  away_player4 <- lineup[9]
-  away_player5 <- lineup[10]
+# Include ALL players - no minimum possession filter
+print("Including ALL players - no filtering applied")
 
-  zeroRow <- rep(0, length(players_in) * 2)
+print(paste0("Final dataset: ", length(players), " players, ", nrow(lineup_data), " possessions"))
 
-  # HOME TEAM (OFFENSE) - positive values
-  zeroRow[which(players_in == home_player1)] <- 1
-  zeroRow[which(players_in == home_player2)] <- 1
-  zeroRow[which(players_in == home_player3)] <- 1
-  zeroRow[which(players_in == home_player4)] <- 1
-  zeroRow[which(players_in == home_player5)] <- 1
+# Memory-efficient sparse matrix creation for RAPM
 
-  # AWAY TEAM (DEFENSE) - negative values
-  # Use second half of the matrix for defensive ratings
-  zeroRow[which(players_in == away_player1) + length(players_in)] <- -1
-  zeroRow[which(players_in == away_player2) + length(players_in)] <- -1
-  zeroRow[which(players_in == away_player3) + length(players_in)] <- -1
-  zeroRow[which(players_in == away_player4) + length(players_in)] <- -1
-  zeroRow[which(players_in == away_player5) + length(players_in)] <- -1
+# FAST VECTORIZED SPARSE MATRIX CREATION - MUCH FASTER!
+print("Creating sparse matrix (VECTORIZED - MUCH FASTER)...")
 
-  return(zeroRow)
-}
+n_possessions <- nrow(lineup_data)
+n_players <- length(players)
+n_cols <- n_players * 2  # offense and defense
 
-# Create the player matrix from home team perspective
-print("Creating player matrix (this may take a moment)...")
-player_matrix_home <- t(apply(
-  lineup_data[, c("home_player_1", "home_player_2", "home_player_3", "home_player_4", "home_player_5",
-                   "away_player_1", "away_player_2", "away_player_3", "away_player_4", "away_player_5")],
-  1,
-  function(x) make_matrix_rows(lineup = x, players_in = players)
-))
+# Create player index lookup for fast conversion
+player_index <- setNames(1:n_players, players)
 
-# Convert to sparse matrix for efficiency
-player_matrix_home <- as(player_matrix_home, "dgCMatrix")
-target_home <- lineup_data$home_ppp100
+# Extract player matrices as numeric matrices
+home_players_matrix <- as.matrix(lineup_data[, c("home_player_1", "home_player_2",
+                                                 "home_player_3", "home_player_4", "home_player_5")])
+away_players_matrix <- as.matrix(lineup_data[, c("away_player_1", "away_player_2",
+                                                 "away_player_3", "away_player_4", "away_player_5")])
 
-print(paste0("Home team matrix dimensions: ", nrow(player_matrix_home), " x ", ncol(player_matrix_home)))
+# Convert to indices - VECTORIZED
+home_indices <- matrix(player_index[as.character(home_players_matrix)], nrow = n_possessions, ncol = 5)
+away_indices <- matrix(player_index[as.character(away_players_matrix)], nrow = n_possessions, ncol = 5)
 
-# Create matrix from away team perspective (flip the sign)
-make_matrix_rows_away <- function(lineup, players_in) {
-  home_player1 <- lineup[1]
-  home_player2 <- lineup[2]
-  home_player3 <- lineup[3]
-  home_player4 <- lineup[4]
-  home_player5 <- lineup[5]
-  away_player1 <- lineup[6]
-  away_player2 <- lineup[7]
-  away_player3 <- lineup[8]
-  away_player4 <- lineup[9]
-  away_player5 <- lineup[10]
+# Create row indices (repeat each possession 5 times for 5 players)
+row_indices <- rep(1:n_possessions, 5)
 
-  zeroRow <- rep(0, length(players_in) * 2)
+# Create column indices for home team matrix
+col_indices_home_off <- as.vector(home_indices)                    # Home offense
+col_indices_away_def <- as.vector(away_indices) + n_players       # Away defense
 
-  # AWAY TEAM (OFFENSE) - positive values
-  zeroRow[which(players_in == away_player1)] <- 1
-  zeroRow[which(players_in == away_player2)] <- 1
-  zeroRow[which(players_in == away_player3)] <- 1
-  zeroRow[which(players_in == away_player4)] <- 1
-  zeroRow[which(players_in == away_player5)] <- 1
+# Create column indices for away team matrix
+col_indices_away_off <- as.vector(away_indices)                   # Away offense
+col_indices_home_def <- as.vector(home_indices) + n_players       # Home defense
 
-  # HOME TEAM (DEFENSE) - negative values
-  zeroRow[which(players_in == home_player1) + length(players_in)] <- -1
-  zeroRow[which(players_in == home_player2) + length(players_in)] <- -1
-  zeroRow[which(players_in == home_player3) + length(players_in)] <- -1
-  zeroRow[which(players_in == home_player4) + length(players_in)] <- -1
-  zeroRow[which(players_in == home_player5) + length(players_in)] <- -1
+print("Building combined sparse matrix...")
 
-  return(zeroRow)
-}
+# Create COMBINED sparse matrix directly (much faster than rbind)
+i_all <- c(row_indices, row_indices,                              # Home team rows
+           row_indices + n_possessions, row_indices + n_possessions) # Away team rows
+j_all <- c(col_indices_home_off, col_indices_away_def,           # Home offense + Away defense
+           col_indices_away_off, col_indices_home_def)            # Away offense + Home defense
+x_all <- c(rep(1, length(row_indices)), rep(-1, length(row_indices)),    # Home team
+           rep(1, length(row_indices)), rep(-1, length(row_indices)))     # Away team
 
-# Create away team matrix
-player_matrix_away <- t(apply(
-  lineup_data[, c("home_player_1", "home_player_2", "home_player_3", "home_player_4", "home_player_5",
-                   "away_player_1", "away_player_2", "away_player_3", "away_player_4", "away_player_5")],
-  1,
-  function(x) make_matrix_rows_away(lineup = x, players_in = players)
-))
-
-player_matrix_away <- as(player_matrix_away, "dgCMatrix")
-target_away <- lineup_data$away_ppp100
-
-# Combine both perspectives for more data
-player_matrix <- rbind(player_matrix_home, player_matrix_away)
-target <- c(target_home, target_away)
+# Create final sparse matrix
+player_matrix <- sparseMatrix(i = i_all, j = j_all, x = x_all, dims = c(2 * n_possessions, n_cols))
+target <- c(lineup_data$home_ppp100, lineup_data$away_ppp100)
 
 print(paste0("Combined matrix dimensions: ", nrow(player_matrix), " x ", ncol(player_matrix)))
 print(paste0("Target vector length: ", length(target)))
@@ -242,8 +401,8 @@ kable(rapm_results[1:20, ] %>%
       align = "c")
 
 # Save results
-write_csv(rapm_results, "womens_basketball_RAPM_2024.csv")
-print("Results saved to womens_basketball_RAPM_2024.csv")
+write_csv(rapm_results, "womens_basketball_RAPM_2025.csv")
+print("Results saved to womens_basketball_RAPM_2025.csv")
 
 # Quick summary stats
 print(paste0("Players analyzed: ", nrow(rapm_results)))
